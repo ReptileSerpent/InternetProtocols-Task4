@@ -11,10 +11,19 @@ def remove_expired_entries():
 	global dns_cache
 	dns_cache_copy = copy.deepcopy(dns_cache)	# otherwise can't pop labels in for loop
 	for dns_label in dns_cache:
-		unused, expiration_time = dns_cache_copy[dns_label]
-		if (time.time() > expiration_time):
-			dns_cache_copy.pop(dns_label, None)
-			print(str(dns_label) + " expired. Labels in cache: " + str(dns_cache_copy.__len__()))
+		dictionary = dns_cache[dns_label]
+		should_break = False
+		for key in dictionary:
+			responses_plus_expiration_time = dns_cache[dns_label][key]
+			for entry in dns_cache[dns_label][key]:
+				responses, expiration_time = entry
+				if (time.time() > expiration_time):
+					dns_cache_copy.pop(dns_label, None)
+					print(str(dns_label) + " expired. Labels in cache now: " + str(dns_cache_copy.__len__()))
+					should_break = True
+					break
+			if (should_break):
+				break
 
 	dns_cache = dns_cache_copy
 
@@ -36,14 +45,15 @@ def respond_to_service_request(packet, user_address):
 
 	for question in questions:
 		if question.qname in dns_cache:
-			cached_response, unused_ttl = dns_cache[question.qname]
 			print (" " + str(question.qname) + " already in cache")
 			
-			reply_for_user.add_answer(cached_response)
+			fitting_responses_plus_ttl = dns_cache[question.qname][question.qtype]
+			for response, unused_ttl in fitting_responses_plus_ttl:
+				reply_for_user.add_answer(response)
 		else:
 			print(" " + str(question.qname) + " not yet in cache")
 			forwarder_socket.sendto(dnslib.DNSRecord.question(question.qname).pack(), (forwarder, 53))
-			
+
 			attempts = 0
 			forwarder_response = None
 			while (True):
@@ -57,12 +67,18 @@ def respond_to_service_request(packet, user_address):
 					print("Unable to reply to user, forwarder not responding")
 					return
 
-			reply_for_user.add_answer(dnslib.DNSRecord.parse(forwarder_response))
+			# the responses should be in the cache by now
+			if question.qname in dns_cache:
+				fitting_responses_plus_ttl = dns_cache[question.qname][question.qtype]
+				for response, unused_ttl in fitting_responses_plus_ttl:
+					reply_for_user.add_answer(response)
+			else:
+				raise Exception("Response from forwarder wasn't found in the cache")	# should never happen
 
 	reply_as_string = str(reply_for_user)
 
 	# send formed reply back to user
-	service_socket.sendto(bytes(reply_as_string, "ascii"), (user_address, 53))
+	service_socket.sendto(bytes(reply_for_user.pack()), (user_address, 53))
 		
 	print(" Sent a dns reply to " + user_address)
 
@@ -74,7 +90,13 @@ def look_for_response_from_forwarder(packet):
 		# putting new things into cache
 		parsed = dnslib.DNSRecord.parse(packet)
 		for question in parsed.rr:
-			dns_cache[question.rname]= (parsed, int(time.time()) + question.ttl)
+			rr_to_cache = (question, int(time.time()) + question.ttl)
+			try:
+				dns_cache[question.rname][question.rtype].append(rr_to_cache)
+			except KeyError:
+				dns_cache[question.rname] = {}
+				dns_cache[question.rname].setdefault(question.rtype, [])
+				dns_cache[question.rname][question.rtype].append(rr_to_cache)
 
 		print("  Contacting forwarder: success")
 		return packet
@@ -107,8 +129,13 @@ try:
 except Exception as exception:
 	print ("Failed to read dns cache from " + cache_filepath + ". Proceeding with an empty cache. Will later attempt to write the cache to the specified filepath during server shutdown. Exception: " + str(exception))
 
+test_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)		# for testing
+
 should_shutdown = False
 while not(should_shutdown):
+	# for testing
+	test_socket.sendto(dnslib.DNSRecord.question("vk.com").pack(), ("127.0.0.1", 53))
+
 	remove_expired_entries()
 	look_for_new_service_requests()
 	time.sleep(1)	# for looking at printed info in the terminal
@@ -118,6 +145,7 @@ while not(should_shutdown):
 
 service_socket.close()
 forwarder_socket.close()
+test_socket.close()				# for testing
 try:
 	cache_file = open(cache_filepath, 'w+b')
 	pickle.dump(dns_cache, cache_file)
